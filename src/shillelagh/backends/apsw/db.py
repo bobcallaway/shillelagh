@@ -508,8 +508,7 @@ def connect(
 
     all_adapters = []
     for entry_point in iter_entry_points("shillelagh.adapter"):
-        print(entry_point.name)
-        if entry_point.name != "shillelagh.adapters.api.gsheets.adapter:GSheetsAPI":
+        if entry_point.name != "gsheetsapi":
             continue
         try:
             adapter = entry_point.load()
