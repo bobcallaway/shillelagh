@@ -155,6 +155,10 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
         self._results: Optional[Iterator[Tuple[Any, ...]]] = None
         self._rowcount = -1
 
+    @property
+    def lastrowid(self):
+        return None
+
     @property  # type: ignore
     @check_closed
     def rowcount(self) -> int:
