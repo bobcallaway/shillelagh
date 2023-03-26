@@ -27,16 +27,18 @@ class APSWSafeDialect(APSWDialect):
 
     """
 
+    # This is supported in ``SQLiteDialect``, and equally supported here. See
+    # https://docs.sqlalchemy.org/en/14/core/connections.html#caching-for-third-party-dialects
+    # for more context.
+    supports_statement_cache = True
+
     def __init__(
         self,
         adapters: Optional[List[str]] = None,
         adapter_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
         **kwargs: Any,
     ):
-        super().__init__(**kwargs)
-        self._adapters = adapters
-        self._adapter_kwargs = adapter_kwargs or {}
-        self._safe = True
+        super().__init__(adapters, adapter_kwargs, safe=True, **kwargs)
 
     def create_connect_args(
         self,

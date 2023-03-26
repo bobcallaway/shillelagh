@@ -23,22 +23,23 @@ from typing import (
 )
 
 import apsw
+from packaging.version import Version
 
 from shillelagh.adapters.base import Adapter
 from shillelagh.exceptions import ProgrammingError
 from shillelagh.fields import (
     Blob,
+    FastISODateTime,
     Field,
     Float,
     IntBoolean,
-    Integer,
     ISODate,
-    ISODateTime,
     ISOTime,
     Order,
     RowID,
     String,
     StringDuration,
+    StringInteger,
 )
 from shillelagh.filters import Filter, Operator
 from shillelagh.lib import deserialize
@@ -51,6 +52,18 @@ from shillelagh.typing import (
     SQLiteValidType,
 )
 
+if Version(apsw.apswversion()) >= Version("3.41.0.0"):  # pragma: no cover
+    from apsw.ext import index_info_to_dict
+else:  # pragma: no cover
+    apsw.IndexInfo = Any  # for type annotation
+
+    # pylint: disable=unused-argument
+    def index_info_to_dict(index_info: apsw.IndexInfo) -> None:
+        """
+        Dummy function for testing.
+        """
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -61,15 +74,29 @@ operator_map = {
     apsw.SQLITE_INDEX_CONSTRAINT_GT: Operator.GT,
     apsw.SQLITE_INDEX_CONSTRAINT_LE: Operator.LE,
     apsw.SQLITE_INDEX_CONSTRAINT_LT: Operator.LT,
-    # SQLITE_INDEX_CONSTRAINT_LIKE >= 3.10.0
-    65: Operator.LIKE,
-    # SQLITE_INDEX_CONSTRAINT_NE, >= 3.21.0
-    68: Operator.NE,
-    # SQLITE_INDEX_CONSTRAINT_ISNULL, >=3.21.0
-    69: Operator.IS_NULL,
-    # SQLITE_INDEX_CONSTRAINT_ISNOTNULL, >=3.21.0
-    70: Operator.IS_NOT_NULL,
 }
+
+
+def _add_sqlite_constraint(constant_name: str, operator: Operator) -> None:
+    if hasattr(apsw, constant_name):
+        operator_map[getattr(apsw, constant_name)] = operator
+
+
+# SQLITE_INDEX_CONSTRAINT_LIKE, >=3.10.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_LIKE", Operator.LIKE)
+# SQLITE_INDEX_CONSTRAINT_NE, >=3.21.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_NE", Operator.NE)
+# SQLITE_INDEX_CONSTRAINT_ISNULL, >=3.21.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_ISNULL", Operator.IS_NULL)
+# SQLITE_INDEX_CONSTRAINT_ISNOTNULL, >=3.21.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_ISNOTNULL", Operator.IS_NOT_NULL)
+# SQLITE_INDEX_CONSTRAINT_LIMIT, >=3.38.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_LIMIT", Operator.LIMIT)
+# SQLITE_INDEX_CONSTRAINT_OFFSET, >=3.38.0
+_add_sqlite_constraint("SQLITE_INDEX_CONSTRAINT_OFFSET", Operator.OFFSET)
+
+# limit and offset are special constraints without an associated column index
+LIMIT_OFFSET_INDEX = -1
 
 # map for converting between Python native types (boolean, datetime, etc.)
 # and types understood by SQLite (integers, strings, etc.)
@@ -80,9 +107,9 @@ type_map: Dict[str, Type[Field]] = {
         StringDuration,
         Float,
         IntBoolean,
-        Integer,
+        StringInteger,
         ISODate,
-        ISODateTime,
+        FastISODateTime,
         ISOTime,
         String,
     ]
@@ -155,7 +182,10 @@ def get_all_bounds(
         constraintargs,
     ):
         if sqlite_index_constraint not in operator_map:
+            # pylint: disable=broad-exception-raised
             raise Exception(f"Invalid constraint passed: {sqlite_index_constraint}")
+        if column_index == LIMIT_OFFSET_INDEX:
+            continue
         operator = operator_map[sqlite_index_constraint]
         column_name = column_names[column_index]
         column_type = columns[column_name]
@@ -167,6 +197,33 @@ def get_all_bounds(
         all_bounds[column_name].add((operator, value))
 
     return all_bounds
+
+
+def get_limit_offset(
+    indexes: List[Index],
+    constraintargs: List[Any],
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Extract limit and offset.
+    """
+    limit = offset = None
+
+    for (column_index, sqlite_index_constraint), constraint in zip(
+        indexes,
+        constraintargs,
+    ):
+        if sqlite_index_constraint not in operator_map:
+            # pylint: disable=broad-exception-raised
+            raise Exception(f"Invalid constraint passed: {sqlite_index_constraint}")
+        if column_index != LIMIT_OFFSET_INDEX:
+            continue
+        operator = operator_map[sqlite_index_constraint]
+        if operator == Operator.LIMIT:
+            limit = constraint
+        elif operator == Operator.OFFSET:
+            offset = constraint
+
+    return limit, offset
 
 
 def get_order(
@@ -201,6 +258,7 @@ def get_bounds(
                 bounds[column_name] = class_.build(operations)
                 break
         else:
+            # pylint: disable=broad-exception-raised
             raise Exception("No valid filter found")
 
     return bounds
@@ -229,7 +287,7 @@ class VTModule:  # pylint: disable=too-few-public-methods
         """
         Called when a table is first created on a connection.
         """
-        deserialized_args = [deserialize(arg) for arg in args]
+        deserialized_args = [deserialize(arg[1:-1]) for arg in args]
         _logger.debug(
             "Instantiating adapter with deserialized arguments: %s",
             deserialized_args,
@@ -260,6 +318,7 @@ class VTTable:
 
     def __init__(self, adapter: Adapter):
         self.adapter = adapter
+        self.requested_columns: Optional[Set[str]] = None
 
     def get_create_table(self, tablename: str) -> str:
         """
@@ -269,14 +328,17 @@ class VTTable:
         if not columns:
             raise ProgrammingError(f"Virtual table {tablename} has no columns")
 
-        formatted_columns = ", ".join(f'"{k}" {v.type}' for (k, v) in columns.items())
+        quoted_columns = {k.replace('"', '""'): v for k, v in columns.items()}
+        formatted_columns = ", ".join(
+            f'"{k}" {v.type}' for (k, v) in quoted_columns.items()
+        )
         return f'CREATE TABLE "{tablename}" ({formatted_columns})'
 
     def BestIndex(  # pylint: disable=too-many-locals
         self,
         constraints: List[Tuple[int, SQLiteConstraint]],
         orderbys: List[Tuple[int, bool]],
-    ) -> Tuple[List[Constraint], int, str, bool, int]:
+    ) -> Tuple[List[Constraint], int, str, bool, float]:
         """
         Build an index for a given set of constraints and order bys.
 
@@ -297,18 +359,27 @@ class VTTable:
         filtered_columns: List[Tuple[str, Operator]] = []
         for column_index, sqlite_index_constraint in constraints:
             operator = operator_map.get(sqlite_index_constraint)
-            column_name = column_names[column_index]
-            column_type = column_types[column_index]
-            for class_ in column_type.filters:
-                if operator in class_.operators:
-                    filtered_columns.append((column_name, operator))
-                    constraints_used.append((filter_index, column_type.exact))
-                    filter_index += 1
-                    indexes.append((column_index, sqlite_index_constraint))
-                    break
-            else:
-                # no indexes supported in this column
-                constraints_used.append(None)
+
+            # LIMIT/OFFSET
+            if (operator is Operator.LIMIT and self.adapter.supports_limit) or (
+                operator is Operator.OFFSET and self.adapter.supports_offset
+            ):
+                constraints_used.append((filter_index, True))
+                filter_index += 1
+                indexes.append((LIMIT_OFFSET_INDEX, sqlite_index_constraint))
+            # column operator
+            elif column_index >= 0:
+                column_name = column_names[column_index]
+                column_type = column_types[column_index]
+                for class_ in column_type.filters:
+                    if operator in class_.operators:
+                        filtered_columns.append((column_name, operator))
+                        constraints_used.append((filter_index, column_type.exact))
+                        filter_index += 1
+                        indexes.append((column_index, sqlite_index_constraint))
+                        break
+                else:
+                    constraints_used.append(None)
 
         # estimate query cost
         order = get_order(orderbys, column_names)
@@ -338,11 +409,47 @@ class VTTable:
             estimated_cost,
         )
 
+    def BestIndexObject(self, index_info: apsw.IndexInfo) -> bool:
+        """
+        Alternative to ``BestIndex`` that allows returning only selected columns.
+        """
+        columns = self.adapter.get_columns()
+        column_names = list(columns.keys())
+        self.requested_columns = {column_names[i] for i in index_info.colUsed}
+
+        index_info_dict = index_info_to_dict(index_info)
+        constraints = [
+            (constraint.get("iColumn", -1), constraint["op"])
+            for constraint in index_info_dict["aConstraint"]
+        ]
+        orderbys = [
+            (orderby["iColumn"], orderby["desc"])
+            for orderby in index_info_dict["aOrderBy"]
+        ]
+        (
+            constraints_used,
+            index_number,
+            index_name,
+            orderby_consumed,
+            estimated_cost,
+        ) = self.BestIndex(constraints, orderbys)
+
+        for i, constraint in enumerate(constraints_used):
+            if isinstance(constraint, tuple):
+                index_info.set_aConstraintUsage_argvIndex(i, constraint[0])
+                index_info.set_aConstraintUsage_omit(i, constraint[1])
+        index_info.idxNum = index_number
+        index_info.idxStr = index_name
+        index_info.orderByConsumed = orderby_consumed
+        index_info.estimatedCost = estimated_cost
+
+        return True
+
     def Open(self) -> "VTCursor":
         """
         Returns a cursor object.
         """
-        return VTCursor(self.adapter)
+        return VTCursor(self.adapter, self.requested_columns)
 
     def Disconnect(self) -> None:
         """
@@ -398,14 +505,15 @@ class VTCursor:
     An object for iterating over a table.
     """
 
-    def __init__(self, adapter: Adapter):
+    def __init__(self, adapter: Adapter, requested_columns: Optional[Set[str]] = None):
         self.adapter = adapter
+        self.requested_columns = requested_columns
 
         self.data: Iterator[Tuple[Any, ...]]
         self.current_row: Tuple[Any, ...]
         self.eof = False
 
-    def Filter(
+    def Filter(  # pylint: disable=too-many-locals
         self,
         indexnumber: int,  # pylint: disable=unused-argument
         indexname: str,
@@ -427,12 +535,22 @@ class VTCursor:
 
         # compute bounds for each column
         all_bounds = get_all_bounds(indexes, constraintargs, columns)
+        limit, offset = get_limit_offset(indexes, constraintargs)
         bounds = get_bounds(columns, all_bounds)
 
         # compute requested order
         order = get_order(orderbys, column_names)
 
-        rows = self.adapter.get_rows(bounds, order)
+        # limit and offset were introduced in 1.1, and not all adapters support it
+        kwargs: Dict[str, Any] = {}
+        if self.adapter.supports_limit:
+            kwargs["limit"] = limit
+        if self.adapter.supports_offset:
+            kwargs["offset"] = offset
+        if self.adapter.supports_requested_columns:
+            kwargs["requested_columns"] = self.requested_columns
+
+        rows = self.adapter.get_rows(bounds, order, **kwargs)
         rows = convert_rows_to_sqlite(columns, rows)
 
         # if a given column is not present, replace it with ``None``

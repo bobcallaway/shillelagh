@@ -2,6 +2,129 @@
 Changelog
 =========
 
+Next
+====
+
+- Allow specifying custom request headers when using the generic JSON adapter (#337)
+- Fix for escaping identifiers correctly (#340)
+- Support for S3-compatible storage (#343)
+- Adapters can now know which columns were requested (#345)
+- Python 3.11 officially supported (#334)
+- Fix for error when an adapater can't be loaded (#346)
+
+Version 1.2.0 - 2023-02-17
+==========================
+
+- Use ``marshal`` instead of ``pickle`` for adapter argument serde (#321)
+- Support SQLAlchemy 2.0 (and 1.4) (#331)
+- ``s3_select`` can now use credentials from the environment or config files
+
+Version 1.1.5 - 2022-12-08
+==========================
+
+- Handle dataframes without column names (#319)
+- Support booleans when inferring types from data (#318)
+
+Version 1.1.4 - 2022-12-06
+==========================
+
+- Support JSON files in the S3 Select adapter (#314)
+
+Version 1.1.3 - 2022-11-17
+==========================
+
+- Improve generic JSON adapter to handle nested fields (#309)
+
+Version 1.1.2 - 2022-11-01
+==========================
+
+- Fix preventing loading of non-requested adapters (#303)
+- New generic JSON adapter (#304)
+
+Version 1.1.1 - 2022-10-26
+==========================
+
+- Add support for CSV files over HTTP(S) (#296)
+- Fix for fraction parsing in GSheets (#298)
+- Fix for negative dollar format in GSheets (#299)
+- Other small fixes and typos.
+
+Version 1.1.0 - 2022-07-28
+==========================
+
+- CLI now supports multi-line statements (#205)
+- Add new adapter for CSV/JSON/Parquet files stored in S3 (#254)
+- Add support for ``DROP TABLE`` (#258)
+- Add new adapter for scraping data from HTML tables (#259)
+- Add registry for adapters (#268)
+- Adapters can implement ``LIMIT`` and ``OFSET`` (#270)
+- Add support for polymorphic fields (#280)
+- Add docs on architecture (#273), dialects (#278)
+- Improve docs on custom fields (#275)
+- Configuration directory is now system dependent (#283)
+- Row updates should no longer raise errors in SQLAlchemy (#284)
+
+Version 1.0.16 - 2022-07-15
+===========================
+
+- Better serialize/deserialize for virtual table arguments, supporting bytes and other types
+
+Version 1.0.15 - 2022-07-13
+===========================
+
+- Represent integers as strings in SQLite to prevent overflow
+- Add S3 Select adapter
+
+Version 1.0.14 - 2022-05-25
+===========================
+
+- Fix for column names with double quotes
+
+Version 1.0.13 - 2022-05-02
+===========================
+
+- Remove support for Python 3.7
+- Remove upper bounds from dependencies
+
+Version 1.0.12 - 2022-04-28
+===========================
+
+- Allow adapters/dialects to pass custom parameters to ``apsw.Connection``
+
+Version 1.0.11 - 2022-04-14
+===========================
+
+- Read SQLite constants from ``apsw``
+- Fix description returned in the case of empty set
+- Change cost to be a float
+- Fix GSheets ``do_ping``
+- Small fixes and typos.
+
+Version 1.0.10 - 2022-03-14
+===========================
+
+- Relax ``requests`` dependency
+- Enable ``supports_statement_cache``
+
+Version 1.0.9 - 2022-03-12
+==========================
+
+- Fix for GSheets where the first row is not detected as column names
+
+Version 1.0.8 - 2022-03-11
+==========================
+
+- Do not try to import non-specified adapters
+- Fix for querying datetime/date/time via SQLAlchemy
+
+Version 1.0.7 - 2022-03-03
+==========================
+
+- Add support for using Google Application Default Credentials for Google Sheets
+- Make package PEP 561 compatible
+- Add ``requests`` as a dependency
+- Documentation fixes
+
 Version 1.0.6 - 2021-12-30
 ==========================
 

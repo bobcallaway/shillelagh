@@ -6,13 +6,15 @@ This dialect was implemented to replace the ``gsheetsdb`` library.
 """
 import logging
 import urllib.parse
+from datetime import timedelta
 from operator import itemgetter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import requests
 from google.auth.transport.requests import AuthorizedSession
 from sqlalchemy.engine.url import URL
 from sqlalchemy.pool.base import _ConnectionFairy
+from typing_extensions import TypedDict
 
 from shillelagh.adapters.api.gsheets.lib import get_credentials
 from shillelagh.backends.apsw.dialects.base import APSWDialect
@@ -21,19 +23,39 @@ from shillelagh.exceptions import ProgrammingError
 _logger = logging.getLogger(__name__)
 
 
-def extract_query(url: URL) -> Dict[str, str]:
+DEFAULT_TIMEOUT = timedelta(minutes=3)
+
+
+class QueryType(TypedDict, total=False):
+    """
+    Types for parameters in the SQLAlchemy URI query.
+    """
+
+    access_token: str
+    service_account_file: str
+    subject: str
+    app_default_credentials: bool
+
+
+def extract_query(url: URL) -> QueryType:
     """
     Extract the query from the SQLAlchemy URL.
     """
     if url.query:
-        return dict(url.query)
-
+        parameters = dict(url.query)
     # there's a bug in how SQLAlchemy <1.4 handles URLs without hosts,
     # putting the query string as the host; handle that case here
-    if url.host and url.host.startswith("?"):
-        return dict(urllib.parse.parse_qsl(url.host[1:]))  # pragma: no cover
+    elif url.host and url.host.startswith("?"):
+        parameters = dict(urllib.parse.parse_qsl(url.host[1:]))  # pragma: no cover
+    else:
+        parameters = {}
 
-    return {}
+    if "app_default_credentials" in parameters:
+        parameters["app_default_credentials"] = parameters[
+            "app_default_credentials"
+        ].lower() in {"1", "true"}
+
+    return cast(QueryType, parameters)
 
 
 class APSWGSheetsDialect(APSWDialect):
@@ -46,6 +68,11 @@ class APSWGSheetsDialect(APSWDialect):
         >>> engine = create_engine("gsheets://")
 
     """
+
+    # This is supported in ``SQLiteDialect``, and equally supported here. See
+    # https://docs.sqlalchemy.org/en/14/core/connections.html#caching-for-third-party-dialects
+    # for more context.
+    supports_statement_cache = True
 
     name = "gsheets"
 
@@ -70,10 +97,7 @@ class APSWGSheetsDialect(APSWDialect):
         self.list_all_sheets = list_all_sheets
         self.app_default_credentials = app_default_credentials
 
-    def create_connect_args(
-        self,
-        url: URL,
-    ) -> Tuple[Tuple[()], Dict[str, Any]]:
+    def create_connect_args(self, url: URL) -> Tuple[Tuple[()], Dict[str, Any]]:
         adapter_kwargs: Dict[str, Any] = {
             "access_token": self.access_token,
             "service_account_file": self.service_account_file,
@@ -99,12 +123,16 @@ class APSWGSheetsDialect(APSWDialect):
         """
         response = requests.get(
             "https://www.google.com/appsstatus/dashboard/incidents.json",
+            timeout=DEFAULT_TIMEOUT.total_seconds(),
         )
         payload = response.json()
 
         updates = [
             update for update in payload if update["service_name"] == "Google Sheets"
         ]
+        if not updates:
+            return True
+
         updates.sort(key=itemgetter("modified"), reverse=True)
         latest_update = updates[0]
         status: str = latest_update["most_recent_update"]["status"]
@@ -116,7 +144,11 @@ class APSWGSheetsDialect(APSWDialect):
         return status != "SERVICE_OUTAGE"
 
     def get_table_names(  # pylint: disable=unused-argument
-        self, connection: _ConnectionFairy, schema: str = None, **kwargs: Any
+        self,
+        connection: _ConnectionFairy,
+        schema: str = None,
+        sqlite_include_internal: bool = False,
+        **kwargs: Any,
     ) -> List[str]:
         """
         Return a list of table names.

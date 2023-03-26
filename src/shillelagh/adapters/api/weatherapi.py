@@ -37,7 +37,7 @@ def combine_time_filters(bounds: Dict[str, Filter]) -> Range:
         raise ImpossibleFilterError()
 
     if not isinstance(time_range, Range) or not isinstance(time_epoch_range, Range):
-        raise Exception("Invalid filter")
+        raise Exception("Invalid filter")  # pylint: disable=broad-exception-raised
 
     # convert time_epoch range to datetime so we can combine it
     # with the time range
@@ -75,6 +75,11 @@ class WeatherAPI(Adapter):
     """
 
     safe = True
+
+    # Since the adapter doesn't return exact data (see the time columns below)
+    # implementing limit/offset is not worth the trouble.
+    supports_limit = False
+    supports_offset = False
 
     # These two columns can be used to filter the results from the API. We
     # define them as inexact since we will retrieve data for the whole day,
@@ -155,7 +160,7 @@ class WeatherAPI(Adapter):
         self,
         filtered_columns: List[Tuple[str, Operator]],
         order: List[Tuple[str, RequestedOrder]],
-    ) -> int:
+    ) -> float:
         cost = INITIAL_COST
 
         # if the operator is ``Operator.EQ`` we only need to fetch 1 day of data;
@@ -170,6 +175,7 @@ class WeatherAPI(Adapter):
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        **kwargs: Any,
     ) -> Iterator[Row]:
         # combine filters from the two time columns
         try:
@@ -201,7 +207,7 @@ class WeatherAPI(Adapter):
                         tzinfo=local_timezone,
                     )
                     row["rowid"] = int(row["time_epoch"])
-                    yield row
                     _logger.debug(row)
+                    yield row
 
             start += timedelta(days=1)

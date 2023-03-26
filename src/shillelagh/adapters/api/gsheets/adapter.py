@@ -26,10 +26,16 @@ from shillelagh.adapters.api.gsheets.lib import (
 from shillelagh.adapters.api.gsheets.types import SyncMode
 from shillelagh.adapters.api.gsheets.typing import QueryResults
 from shillelagh.adapters.base import Adapter
-from shillelagh.exceptions import ImpossibleFilterError, InternalError, ProgrammingError
+from shillelagh.exceptions import (
+    ImpossibleFilterError,
+    InterfaceError,
+    InternalError,
+    ProgrammingError,
+    UnauthenticatedError,
+)
 from shillelagh.fields import Field, Order
 from shillelagh.filters import Filter
-from shillelagh.lib import SimpleCostModel, build_sql
+from shillelagh.lib import SimpleCostModel, apply_limit_and_offset, build_sql
 from shillelagh.typing import RequestedOrder, Row
 
 _logger = logging.getLogger(__name__)
@@ -73,6 +79,8 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
     """
 
     safe = True
+    supports_limit = True
+    supports_offset = True
 
     @staticmethod
     def supports(uri: str, fast: bool = True, **kwargs: Any) -> Optional[bool]:
@@ -121,10 +129,6 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         self._original_rows = 0
         self.modified = False
 
-        # When the Chart API fails to recognize the headers we need to
-        # keep track of the offset, so we can request data correctly.
-        self._offset: Optional[int] = None
-
         # Extra metadata. Some of this metadata (sheet name and timezone)
         # can only be fetched if the user is authenticated -- that's OK,
         # since they're only used for DML, which requires authentication.
@@ -136,7 +140,7 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
 
         # Determine columns in the sheet.
         self.columns: Dict[str, Field] = {}
-        self._set_columns()
+        self._set_columns(uri)
 
         # Store row ids for DML. When the first DML command is issued
         # we switch from the Chart API (read-only) to the Sheets API
@@ -254,9 +258,9 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
             try:
                 result = response.json()
             except Exception as ex:
+                self._check_permissions(ex)
                 raise ProgrammingError(
-                    "Response from Google is not valid JSON. Please verify that you "
-                    "have the proper credentials to access the spreadsheet.",
+                    "Response from Google is not valid JSON.",
                 ) from ex
 
         _logger.debug("Received payload: %s", result)
@@ -265,7 +269,31 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
 
         return cast(QueryResults, result)
 
-    def _set_columns(self) -> None:
+    def _check_permissions(self, ex: Exception) -> None:
+        """
+        Check if we have permission to access a sheet.
+
+        This is called when the response from an API is not valid JSON, trying to
+        determine why the payload is not as expected.
+        """
+        session = self._get_session()
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self._spreadsheet_id}"
+            f"/developerMetadata/{self._sheet_id}"
+        )
+        response = session.get(url)
+        if not response.ok:
+            payload = response.json()
+            error = payload["error"]
+
+            # custom exception to trigger oauth
+            if error["code"] == 401:
+                raise UnauthenticatedError(error["message"]) from ex
+
+            # something else happened, raise exception with the message
+            raise InterfaceError(error["message"]) from ex
+
+    def _set_columns(self, uri: str) -> None:
         """
         Download data and extract columns.
 
@@ -281,7 +309,8 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         if all(col["label"] == "" for col in cols):
             _logger.warning("Couldn't extract column labels from sheet")
             if rows:
-                self._offset = 1
+                # update URL with information to skip the first row
+                self.url = get_url(uri, headers=1)
                 for col, cell in zip(cols, rows[0]["c"]):
                     col["label"] = get_value_from_cell(cell)
             else:
@@ -353,10 +382,13 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
 
         return i + 1
 
-    def get_data(
+    def get_data(  # pylint: disable=too-many-locals
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **kwargs: Any,
     ) -> Iterator[Row]:
         """
         Fetch data.
@@ -378,7 +410,7 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
         }:
             values = self._get_values()
             headers = self._get_header_rows(values)
-            rows = (
+            rows: Iterator[Row] = (
                 {
                     reverse_map[letter]: cell
                     for letter, cell in zip(gen_letters(), row)
@@ -386,6 +418,7 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
                 }
                 for row in values[headers:]
             )
+            rows = apply_limit_and_offset(rows, limit, offset)
 
         # For ``BIDIRECTIONAL`` mode we continue using the Chart API to
         # retrieve data. This will happen before every DML query.
@@ -397,8 +430,8 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
                     order,
                     None,
                     self._column_map,
-                    None,
-                    self._offset,
+                    limit,
+                    offset,
                 )
             except ImpossibleFilterError:
                 return
@@ -415,8 +448,9 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
             )
 
         for i, row in enumerate(rows):
-            self._row_ids[i] = row
-            row["rowid"] = i
+            rowid = (offset or 0) + i
+            self._row_ids[rowid] = row
+            row["rowid"] = rowid
             _logger.debug(row)
             yield row
 
@@ -682,3 +716,32 @@ class GSheetsAPI(Adapter):  # pylint: disable=too-many-instance-attributes
 
         self.modified = False
         _logger.info("Success!")
+
+    def drop_table(self) -> None:
+        """
+        Delete a sheet.
+        """
+        session = self._get_session()
+        body = {
+            "requests": [
+                {
+                    "deleteSheet": {
+                        "sheetId": self._sheet_id,
+                    },
+                },
+            ],
+        }
+        url = (
+            "https://sheets.googleapis.com/v4/spreadsheets/"
+            f"{self._spreadsheet_id}:batchUpdate"
+        )
+        _logger.info("POST %s", url)
+        _logger.debug(body)
+        response = session.post(
+            url,
+            json=body,
+        )
+        payload = response.json()
+        _logger.debug(payload)
+        if "error" in payload:
+            raise ProgrammingError(payload["error"]["message"])

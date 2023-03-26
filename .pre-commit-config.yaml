@@ -1,7 +1,7 @@
 exclude: '^docs/conf.py'
 
 repos:
-- repo: git://github.com/pre-commit/pre-commit-hooks
+- repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v3.4.0
   hooks:
   - id: trailing-whitespace
@@ -15,8 +15,6 @@ repos:
   - id: debug-statements
     exclude: ^templates/
   - id: end-of-file-fixer
-  - id: requirements-txt-fixer
-    exclude: ^templates/
   - id: mixed-line-ending
     args: ['--fix=auto']  # replace 'auto' with 'lf' to enforce Linux/Mac line endings or 'crlf' for Windows
 
@@ -32,12 +30,12 @@ repos:
 #     ]
 
 - repo: https://github.com/pycqa/isort
-  rev: 5.7.0
+  rev: 5.12.0
   hooks:
   - id: isort
 
 - repo: https://github.com/psf/black
-  rev: 20.8b1
+  rev: 22.10.0
   hooks:
   - id: black
     language_version: python3
@@ -50,7 +48,7 @@ repos:
 #   - id: blacken-docs
 #     additional_dependencies: [black]
 
-- repo: https://gitlab.com/pycqa/flake8
+- repo: https://github.com/PyCQA/flake8
   rev: 3.9.2
   hooks:
   - id: flake8
@@ -80,7 +78,7 @@ repos:
 #  - id: reorder-python-imports
 #    args: [--application-directories=.:src]
 - repo: https://github.com/hadialqattan/pycln
-  rev: v1.0.3 # Possible releases: https://github.com/hadialqattan/pycln/tags
+  rev: v2.1.2
   hooks:
   - id: pycln
     args: [--config=pyproject.toml]
@@ -89,7 +87,8 @@ repos:
   hooks:
   - id: pylint
     name: pylint
-    entry: pylint
+    entry: pylint --disable=duplicate-code,use-implicit-booleaness-not-comparison
     language: system
     types: [python]
     exclude: ^templates/
+    args: [--disable=use-implicit-booleaness-not-comparison]

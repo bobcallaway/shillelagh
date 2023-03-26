@@ -1,11 +1,11 @@
-# pylint: disable=invalid-name, c-extension-no-member, no-self-use, unused-import
+# pylint: disable=invalid-name, c-extension-no-member, unused-import
 """
 A DB API 2.0 wrapper for APSW.
 """
 import datetime
 import itertools
 import logging
-from collections import Counter
+import re
 from functools import partial, wraps
 from typing import (
     Any,
@@ -21,13 +21,13 @@ from typing import (
 )
 
 import apsw
-from pkg_resources import iter_entry_points
+from packaging.version import Version
 
 from shillelagh import functions
 from shillelagh.adapters.base import Adapter
+from shillelagh.adapters.registry import registry
 from shillelagh.backends.apsw.vt import VTModule, type_map
-from shillelagh.exceptions import Warning  # pylint: disable=redefined-builtin
-from shillelagh.exceptions import (
+from shillelagh.exceptions import (  # nopycln: import; pylint: disable=redefined-builtin
     DatabaseError,
     DataError,
     Error,
@@ -37,9 +37,15 @@ from shillelagh.exceptions import (
     NotSupportedError,
     OperationalError,
     ProgrammingError,
+    Warning,
 )
 from shillelagh.fields import Blob, Field
-from shillelagh.lib import combine_args_kwargs, escape, find_adapter, serialize
+from shillelagh.lib import (
+    combine_args_kwargs,
+    escape_identifier,
+    find_adapter,
+    serialize,
+)
 from shillelagh.types import (
     BINARY,
     DATETIME,
@@ -64,7 +70,7 @@ sqlite_version_info = tuple(
 )
 
 NO_SUCH_TABLE = "SQLError: no such table: "
-SCHEMA = "main"
+DEFAULT_SCHEMA = "main"
 
 CURSOR_METHOD = TypeVar("CURSOR_METHOD", bound=Callable[..., Any])
 
@@ -127,12 +133,13 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
     Connection cursor.
     """
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         cursor: "apsw.Cursor",
         adapters: List[Type[Adapter]],
         adapter_kwargs: Dict[str, Dict[str, Any]],
         isolation_level: Optional[str] = None,
+        schema: str = DEFAULT_SCHEMA,
     ):
         self._cursor = cursor
         self._adapters = adapters
@@ -140,6 +147,8 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
 
         self.in_transaction = False
         self.isolation_level = isolation_level
+
+        self.schema = schema
 
         # This read/write attribute specifies the number of rows to fetch at a
         # time with .fetchmany(). It defaults to 1 meaning to fetch a single
@@ -154,6 +163,20 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
         # this is set to an iterator of rows after a successful query
         self._results: Optional[Iterator[Tuple[Any, ...]]] = None
         self._rowcount = -1
+
+        # Approach from: https://github.com/rogerbinns/apsw/issues/160#issuecomment-33927297
+        # pylint: disable=unused-argument
+        def exectrace(
+            cursor: "apsw.Cursor",
+            sql: str,
+            bindings: Optional[Tuple[Any, ...]],
+        ) -> bool:
+            # In the case of an empty sequence, fall back to None,
+            # meaning no rows returned.
+            self.description = self._cursor.getdescription() or None
+            return True
+
+        self._cursor.setexectrace(exectrace)
 
     @property
     def lastrowid(self):
@@ -220,7 +243,30 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
                 uri = message[len(NO_SUCH_TABLE) :]
                 self._create_table(uri)
 
+        if uri := self._drop_table_uri(operation):
+            adapter, args, kwargs = find_adapter(
+                uri,
+                self._adapter_kwargs,
+                self._adapters,
+            )
+            instance = adapter(*args, **kwargs)
+            instance.drop_table()
+
         return self
+
+    def _drop_table_uri(self, operation: str) -> Optional[str]:
+        """
+        Build a ``DROP TABLE`` regexp.
+        """
+        regexp = re.compile(
+            rf"^\s*DROP\s+TABLE\s+(IF\s+EXISTS\s+)?"
+            rf'({self.schema}\.)?(?P<uri>(.*?)|(".*?"))\s*;?\s*$',
+            re.IGNORECASE,
+        )
+        if match := regexp.match(operation):
+            return match.groupdict()["uri"].strip('"')
+
+        return None
 
     def _convert(self, cursor: "apsw.Cursor") -> Iterator[Tuple[Any, ...]]:
         """
@@ -230,7 +276,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
         we need to do the conversion here.
         """
         if not self.description:
-            return
+            return  # pragma: no cover
 
         for row in cursor:
             yield tuple(
@@ -245,19 +291,16 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
 
         This method is called the first time a virtual table is accessed.
         """
-        prefix = f"{SCHEMA}."
+        prefix = self.schema + "."
         if uri.startswith(prefix):
             uri = uri[len(prefix) :]
 
-        # collect arguments from URI and connection and serialize them
-        adapter = find_adapter(uri, self._adapter_kwargs, self._adapters)
-        key = adapter.__name__.lower()
-        args = adapter.parse_uri(uri)
-        kwargs = self._adapter_kwargs.get(key, {})
+        adapter, args, kwargs = find_adapter(uri, self._adapter_kwargs, self._adapters)
         formatted_args = ", ".join(
-            serialize(arg) for arg in combine_args_kwargs(adapter, *args, **kwargs)
+            f"'{serialize(arg)}'"
+            for arg in combine_args_kwargs(adapter, *args, **kwargs)
         )
-        table_name = escape(uri)
+        table_name = escape_identifier(uri)
         self._cursor.execute(
             f'CREATE VIRTUAL TABLE "{table_name}" USING {adapter.__name__}({formatted_args})',
         )
@@ -271,7 +314,7 @@ class Cursor:  # pylint: disable=too-many-instance-attributes
         try:
             description = self._cursor.getdescription()
         except apsw.ExecutionCompleteError:
-            return None
+            return self.description
 
         return [
             (
@@ -392,20 +435,31 @@ class Connection:
 
     """Connection."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         path: str,
         adapters: List[Type[Adapter]],
         adapter_kwargs: Dict[str, Dict[str, Any]],
         isolation_level: Optional[str] = None,
+        apsw_connection_kwargs: Optional[Dict[str, Any]] = None,
+        schema: str = DEFAULT_SCHEMA,
     ):
         # create underlying APSW connection
-        self._connection = apsw.Connection(path)
+        apsw_connection_kwargs = apsw_connection_kwargs or {}
+        self._connection = apsw.Connection(path, **apsw_connection_kwargs)
         self.isolation_level = isolation_level
+        self.schema = schema
 
         # register adapters
         for adapter in adapters:
-            self._connection.createmodule(adapter.__name__, VTModule(adapter))
+            if Version(apsw.apswversion()) >= Version("3.41.0.0"):
+                self._connection.createmodule(
+                    adapter.__name__,
+                    VTModule(adapter),
+                    use_bestindex_object=adapter.supports_requested_columns,
+                )
+            else:
+                self._connection.createmodule(adapter.__name__, VTModule(adapter))
         self._adapters = adapters
         self._adapter_kwargs = adapter_kwargs
 
@@ -457,6 +511,7 @@ class Connection:
             self._adapters,
             self._adapter_kwargs,
             self.isolation_level,
+            self.schema,
         )
         self.cursors.append(cursor)
 
@@ -482,69 +537,32 @@ class Connection:
         self.close()
 
 
-def connect(
+def connect(  # pylint: disable=too-many-arguments
     path: str,
     adapters: Optional[List[str]] = None,
     adapter_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     safe: bool = False,
     isolation_level: Optional[str] = None,
+    apsw_connection_kwargs: Optional[Dict[str, Any]] = None,
+    schema: str = DEFAULT_SCHEMA,
 ) -> Connection:
-    r"""
+    """
     Constructor for creating a connection to the database.
-
-        >>> conn = connect("database.sqlite", ["csvfile", "weatherapi"])
-        >>> curs = conn.cursor()
-
-    Let's create a fake CSV file and access it:
-
-        >>> from pyfakefs.fake_filesystem_unittest import Patcher
-        >>> with Patcher() as patcher:
-        ...     fake_file = patcher.fs.create_file('/foo/bar.csv', contents='"a","b"\n1,2\n3,4')
-        ...     list(curs.execute("SELECT * FROM '/foo/bar.csv'"))
-        [(1.0, 2.0), (3.0, 4.0)]
-
     """
     adapter_kwargs = adapter_kwargs or {}
-
-    all_adapters = []
-    for entry_point in iter_entry_points("shillelagh.adapter"):
-        if entry_point.name != "gsheetsapi":
-            continue
-        try:
-            adapter = entry_point.load()
-        except (ImportError, ModuleNotFoundError):
-            _logger.warning("Couldn't load adapter %s", entry_point)
-            continue
-        all_adapters.append((entry_point.name, adapter))
-
-    all_adapters_names = [name for name, adapter in all_adapters]
-
-    # check if there are any repeated names, to prevent malicious adapters
-    if safe:
-        repeated = {
-            name for name, count in Counter(all_adapters_names).items() if count > 1
-        }
-        if repeated:
-            raise InterfaceError(f'Repeated adapter names found: {", ".join(repeated)}')
-
-    adapters = adapters or ([] if safe else all_adapters_names)
-    enabled_adapters = [
-        adapter
-        for (name, adapter) in all_adapters
-        if name in adapters and (adapter.safe or not safe)
-    ]
+    enabled_adapters = registry.load_all(adapters, safe)
 
     # replace entry point names with class names
     mapping = {
-        name: adapter.__name__.lower()
-        for name, adapter in all_adapters
-        if adapter in enabled_adapters
+        name: adapter.__name__.lower() for name, adapter in enabled_adapters.items()
     }
-    adapter_kwargs = {mapping[k]: v for k, v in adapter_kwargs.items()}
+    adapter_kwargs = {mapping[k]: v for k, v in adapter_kwargs.items() if k in mapping}
 
     return Connection(
         path,
-        enabled_adapters,
+        list(enabled_adapters.values()),
         adapter_kwargs,
         isolation_level,
+        apsw_connection_kwargs,
+        schema,
     )

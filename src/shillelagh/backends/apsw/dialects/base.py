@@ -6,7 +6,7 @@ import sqlalchemy.types
 from sqlalchemy.dialects.sqlite.base import SQLiteDialect
 from sqlalchemy.engine.url import URL
 from sqlalchemy.pool.base import _ConnectionFairy
-from sqlalchemy.sql.visitors import VisitableType
+from sqlalchemy.sql.type_api import TypeEngine
 from typing_extensions import TypedDict
 
 from shillelagh.adapters.base import Adapter
@@ -22,7 +22,7 @@ class SQLAlchemyColumn(TypedDict):
     """
 
     name: str
-    type: VisitableType
+    type: TypeEngine
     nullable: bool
     default: Optional[str]
     autoincrement: str
@@ -39,6 +39,18 @@ class APSWDialect(SQLiteDialect):
 
     name = "shillelagh"
     driver = "apsw"
+
+    # This is supported in ``SQLiteDialect``, and equally supported here. See
+    # https://docs.sqlalchemy.org/en/14/core/connections.html#caching-for-third-party-dialects
+    # for more context.
+    supports_statement_cache = True
+
+    # ``SQLiteDialect.colspecs`` has custom representations for objects that SQLite stores
+    # as string (eg, timestamps). Since the Shillelagh DB API driver returns them as
+    # proper objects the custom representations are not needed.
+    colspecs: Dict[TypeEngine, TypeEngine] = {}
+
+    supports_sane_rowcount = False
 
     @classmethod
     def dbapi(cls):  # pylint: disable=method-hidden
@@ -73,13 +85,18 @@ class APSWDialect(SQLiteDialect):
         }
 
     def do_ping(self, dbapi_connection: _ConnectionFairy) -> bool:
+        """
+        Return true if the database is online.
+        """
         return True
 
-    def has_table(
+    def has_table(  # pylint: disable=unused-argument
         self,
         connection: _ConnectionFairy,
         table_name: str,
         schema: Optional[str] = None,
+        info_cache: Optional[Dict[Any, Any]] = None,
+        **kwargs: Any,
     ) -> bool:
         """
         Return true if a given table exists.
@@ -135,12 +152,9 @@ def get_adapter_for_table_name(
     using the connection to properly pass any adapter kwargs.
     """
     raw_connection = cast(db.Connection, connection.engine.raw_connection())
-    adapter = find_adapter(
+    adapter, args, kwargs = find_adapter(
         table_name,
         raw_connection._adapter_kwargs,
         raw_connection._adapters,
     )
-    key = adapter.__name__.lower()
-    args = adapter.parse_uri(table_name)
-    kwargs = raw_connection._adapter_kwargs.get(key, {})
     return adapter(*args, **kwargs)  # type: ignore

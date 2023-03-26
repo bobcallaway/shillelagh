@@ -40,7 +40,16 @@ class Adapter:
     # explicitly listed:
     #
     #     >>> engine = create_engine("shillelagh+safe://", adapters=["gsheetsapi"])
+    #
     safe = False
+
+    # if true, a corresponding argument will be passed in the kwargs of
+    # ``get_rows`` and ``get_data``
+    supports_limit = False
+    supports_offset = False
+
+    # if true, the requested columns will be passed to ``get_rows`` and ``get_data``
+    supports_requested_columns = False
 
     def __init__(self, *args: Any, **kwargs: Any):  # pylint: disable=unused-argument
         # ensure ``self.close`` gets called before GC
@@ -86,7 +95,7 @@ class Adapter:
         """Parse table name, and return arguments to instantiate adapter."""
         raise NotImplementedError("Subclasses must implement ``parse_uri``")
 
-    def get_metadata(self) -> Dict[str, Any]:  # pylint: disable=no-self-use
+    def get_metadata(self) -> Dict[str, Any]:
         """Return any extra metadata about the table."""
         return {}
 
@@ -102,11 +111,11 @@ class Adapter:
             inspect.getmembers(self, lambda attribute: isinstance(attribute, Field)),
         )
 
-    def get_cost(  # pylint: disable=unused-argument, no-self-use
+    def get_cost(  # pylint: disable=unused-argument
         self,
         filtered_columns: List[Tuple[str, Operator]],
         order: List[Tuple[str, RequestedOrder]],
-    ) -> int:
+    ) -> float:
         """
         Estimate the query cost.
 
@@ -119,6 +128,7 @@ class Adapter:
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        **kwargs: Any,
     ) -> Iterator[Row]:
         """
         Yield rows as adapter-specific types.
@@ -137,6 +147,7 @@ class Adapter:
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        **kwargs: Any,
     ) -> Iterator[Row]:
         """
         Yield rows as native Python types.
@@ -145,13 +156,14 @@ class Adapter:
         parsers = {column_name: field.parse for column_name, field in columns.items()}
         parsers["rowid"] = RowID().parse
 
-        for row in self.get_data(bounds, order):
+        for row in self.get_data(bounds, order, **kwargs):
             yield {
                 column_name: parsers[column_name](value)
                 for column_name, value in row.items()
+                if column_name in parsers
             }
 
-    def insert_data(self, row: Row) -> int:  # pylint: disable=no-self-use
+    def insert_data(self, row: Row) -> int:
         """
         Insert a single row with adapter-specific types.
 
@@ -175,7 +187,7 @@ class Adapter:
         }
         return self.insert_data(row)
 
-    def delete_data(self, row_id: int) -> None:  # pylint: disable=no-self-use
+    def delete_data(self, row_id: int) -> None:
         """Delete a row from the table."""
         raise NotSupportedError("Adapter does not support ``DELETE`` statements")
 
@@ -194,8 +206,13 @@ class Adapter:
         This method by default will call a delete followed by an insert.
         Adapters can implement their own more efficient methods.
         """
-        self.delete_data(row_id)
-        self.insert_data(row)
+        try:
+            self.delete_data(row_id)
+            self.insert_data(row)
+        except NotSupportedError as ex:
+            raise NotSupportedError(
+                "Adapter does not support ``UPDATE`` statements",
+            ) from ex
 
     def update_row(self, row_id: int, row: Row) -> None:
         """
@@ -215,4 +232,9 @@ class Adapter:
 
         Adapters should use this method to perform any pending changes when the
         connection is closed.
+        """
+
+    def drop_table(self) -> None:
+        """
+        Drop a table.
         """

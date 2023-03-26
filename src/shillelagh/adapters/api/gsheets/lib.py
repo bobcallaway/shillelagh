@@ -5,6 +5,7 @@ import string
 import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
 
+import google.auth
 import google.oauth2.credentials
 import google.oauth2.service_account
 import google.auth

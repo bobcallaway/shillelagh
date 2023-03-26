@@ -6,12 +6,19 @@ deleted, and updated. It's not very practical since it requires the data
 to be written with the ``QUOTE_NONNUMERIC`` format option, with strings
 explicitly quoted. It's also not very efficient, since it implements the
 filtering and sorting in Python, instead of relying on the backend.
+
+Remote files (HTTP/HTTPS) are also supported in read-only mode.
 """
 import csv
 import logging
 import os
+import tempfile
+import urllib.parse
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
+
+import requests
 
 from shillelagh.adapters.base import Adapter
 from shillelagh.exceptions import ProgrammingError
@@ -26,13 +33,17 @@ from shillelagh.filters import (
     Range,
 )
 from shillelagh.lib import RowIDManager, analyze, filter_data, update_order
-from shillelagh.typing import RequestedOrder, Row
+from shillelagh.typing import Maybe, MaybeType, RequestedOrder, Row
 
 _logger = logging.getLogger(__name__)
 
 INITIAL_COST = 0
 FILTERING_COST = 1000
 SORTING_COST = 10000
+
+DEFAULT_TIMEOUT = timedelta(minutes=3)
+
+SUPPORTED_PROTOCOLS = {"http", "https"}
 
 
 class RowTracker:
@@ -54,7 +65,7 @@ class RowTracker:
 class CSVFile(Adapter):
 
     r"""
-    An adapter to CSV files.
+    An adapter for CSV files.
 
     The files must be written with the ``QUOTE_NONNUMERIC`` format option, with
     strings explicitly quoted::
@@ -85,18 +96,55 @@ class CSVFile(Adapter):
     # the filesystem, or potentially overwrite existing files
     safe = False
 
+    supports_limit = True
+    supports_offset = True
+
     @staticmethod
-    def supports(uri: str, fast: bool = True, **kwargs: Any) -> Optional[bool]:
-        return Path(uri).suffix == ".csv"
+    def supports(uri: str, fast: bool = True, **kwargs: Any) -> MaybeType:
+        # local file
+        path = Path(uri)
+        if path.suffix == ".csv" and path.exists():
+            return True
+
+        # remote file
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme not in SUPPORTED_PROTOCOLS:
+            return False
+
+        # URLs ending in ``.csv`` are probably CSV files
+        if parsed.path.endswith(".csv"):
+            return True
+
+        # do a head request to get mimetype
+        if fast:
+            return Maybe
+
+        response = requests.head(uri, timeout=DEFAULT_TIMEOUT.total_seconds())
+        return "text/csv" in response.headers.get("content-type", "")
 
     @staticmethod
     def parse_uri(uri: str) -> Tuple[str]:
         return (uri,)
 
-    def __init__(self, path: str):
+    def __init__(self, path_or_uri: str):
         super().__init__()
 
-        self.path = Path(path)
+        path = Path(path_or_uri)
+        if path.suffix == ".csv" and path.exists():
+            self.local = True
+        else:
+            self.local = False
+
+            # download CSV file
+            with tempfile.NamedTemporaryFile(delete=False) as output:
+                response = requests.get(
+                    path_or_uri,
+                    timeout=DEFAULT_TIMEOUT.total_seconds(),
+                )
+                output.write(response.content)
+            path = Path(output.name)
+
+        self.path = path
         self.modified = False
 
         _logger.info("Opening file CSV file %s to load metadata", self.path)
@@ -139,10 +187,10 @@ class CSVFile(Adapter):
         self,
         filtered_columns: List[Tuple[str, Operator]],
         order: List[Tuple[str, RequestedOrder]],
-    ) -> int:
+    ) -> float:
         cost = INITIAL_COST
 
-        # filtering the data has constant cost, since ``filter_data`` builds a
+        # filtering the data has linear cost, since ``filter_data`` builds a
         # single filter function applied as the data is streamed
         if filtered_columns:
             cost += FILTERING_COST
@@ -158,6 +206,9 @@ class CSVFile(Adapter):
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **kwargs: Any,
     ) -> Iterator[Row]:
         _logger.info("Opening file CSV file %s to load data", self.path)
         with open(self.path, encoding="utf-8") as csvfile:
@@ -175,11 +226,14 @@ class CSVFile(Adapter):
             # Filter and sort the data. It would probably be more efficient to simply
             # declare the columns as having no filter and no sort order, and let the
             # backend handle this; but it's nice to have an example of how to do this.
-            for row in filter_data(data, bounds, order):
-                yield row
+            for row in filter_data(data, bounds, order, limit, offset):
                 _logger.debug(row)
+                yield row
 
     def insert_data(self, row: Row) -> int:
+        if not self.local:
+            raise ProgrammingError("Cannot apply DML to a remote file")
+
         row_id: Optional[int] = row.pop("rowid")
         row_id = cast(int, self.row_id_manager.insert(row_id))
 
@@ -206,6 +260,9 @@ class CSVFile(Adapter):
         return row_id
 
     def delete_data(self, row_id: int) -> None:
+        if not self.local:
+            raise ProgrammingError("Cannot apply DML to a remote file")
+
         _logger.info("Deleting row with ID %d from CSV file %s", row_id, self.path)
         # on ``DELETE``\s we simply mark the row as deleted, so that it will be ignored
         # on ``SELECT``\s
@@ -219,6 +276,10 @@ class CSVFile(Adapter):
 
         This method will get rid of deleted rows in the files.
         """
+        if not self.local:
+            self.path.unlink()
+            return
+
         if not self.modified:
             return
 
@@ -236,3 +297,6 @@ class CSVFile(Adapter):
 
         os.replace(self.path.with_suffix(".csv.bak"), self.path)
         self.modified = False
+
+    def drop_table(self) -> None:
+        self.path.unlink()

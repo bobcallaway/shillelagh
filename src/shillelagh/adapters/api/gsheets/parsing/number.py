@@ -3,12 +3,12 @@ Parse and format Google Sheet number formats.
 
 https://developers.google.com/sheets/api/guides/formats#number_format_tokens
 """
-# pylint: disable=c-extension-no-member
+# pylint: disable=c-extension-no-member, broad-exception-raised
 import math
 import operator
 import re
 from itertools import zip_longest
-from typing import Any, Dict, Iterator, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Tuple, Union, cast
 
 from shillelagh.adapters.api.gsheets.parsing.base import (
     LITERAL,
@@ -108,7 +108,7 @@ class DIGITS(Token):
             return (
                 {
                     "operation": lambda number: math.copysign(
-                        abs(number) + get_fraction(int(digits)),
+                        abs(number) + get_fraction(digits),
                         number,
                     ),
                 },
@@ -179,7 +179,7 @@ class COMMA(Token):
 
     def parse(self, value: str, tokens: List[Token]) -> Tuple[Dict[str, Any], str]:
         size = len(self.token)
-        return {"operation": lambda number: number * 1000 ** size}, value
+        return {"operation": lambda number: number * 1000**size}, value
 
 
 class E(Token):  # pylint: disable=invalid-name
@@ -229,7 +229,7 @@ class E(Token):  # pylint: disable=invalid-name
         exponent = int(match.group(2))
         size = len(match.group())
 
-        return {"operation": lambda number: number * 10 ** exponent}, value[size:]
+        return {"operation": lambda number: number * 10**exponent}, value[size:]
 
 
 class FRACTION(Token):
@@ -266,7 +266,7 @@ class FRACTION(Token):
             # the denominator needs to be formatted as a fraction, with spaces and zeros
             # right padded
             pattern = "." + groups[1]
-            number = get_fraction(denominator)
+            number = get_fraction(str(denominator))
             formatted_denominator = format_number_pattern(number, pattern).lstrip(".")
 
         if math.floor(numerator) == 0:
@@ -404,28 +404,24 @@ class CONDITION(Token):
         return {}, value
 
 
-def get_fraction(number: int) -> float:
+def get_fraction(number: str) -> float:
     """
     Return the fraction associated with a fractional part.
 
-        >>> get_fraction(9)
+        >>> get_fraction("9")
         0.9
-        >>> get_fraction(123)
+        >>> get_fraction("123")
         0.123
-        >>> get_fraction(1)
+        >>> get_fraction("1")
         0.1
+        >>> get_fraction("001")
+        0.001
 
     """
-    if number < 0:
+    if int(number) < 0:
         raise Exception("Number should be a positive integer")
 
-    # we could do this analytically, but there are too many edge
-    # cases (0 and 10^n, eg)
-    result = float(number)
-    while result >= 1:
-        result /= 10
-
-    return result
+    return cast(float, int(number) / (10 ** len(number)))
 
 
 def parse_number_pattern(value: str, pattern: str) -> float:
@@ -440,13 +436,27 @@ def parse_number_pattern(value: str, pattern: str) -> float:
             number = parse_number_format(value, format_)
             break
         except InvalidValue:
-            pass
+            # weird edge case
+            if value.startswith("-"):
+                try:
+                    number = -parse_number_pattern(value[1:], format_)
+                    break
+                except InvalidValue:
+                    pass
     else:
-        raise Exception(f"Unable to parse value {value} with pattern {pattern}")
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError as ex:
+                raise InvalidValue(
+                    f"Unable to parse value {value} with pattern {pattern}",
+                ) from ex
 
     # is negative?
     if i == 1 and (len(formats) > 2 or (len(formats) == 2 and "@" not in formats[1])):
-        return number * -1
+        return -number
 
     return number
 
@@ -496,7 +506,7 @@ def parse_number_format(value: str, format_: str) -> float:
 
 def has_condition(pattern: str) -> bool:
     """
-    Return true if the pattern has condition metra instructions.
+    Return true if the pattern has condition instructions.
     """
     return bool(re.match(r"\[(>|>=|<|<=|=)\d*(\.\d*)?\]", pattern))
 

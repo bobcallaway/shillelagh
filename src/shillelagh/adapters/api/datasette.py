@@ -3,6 +3,7 @@ An adapter to Datasette instances.
 
 See https://datasette.io/ for more information.
 """
+
 import logging
 import urllib.parse
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Type, cast
@@ -42,15 +43,15 @@ def is_datasette(uri: str) -> bool:
     """
     Identify Datasette servers via a HEAD request.
     """
-    parts = list(urllib.parse.urlparse(uri))
+    parsed = urllib.parse.urlparse(uri)
     try:
         # pylint: disable=unused-variable
-        mountpoint, database, table = parts[2].rsplit("/", 2)
+        mountpoint, database, table = parsed.path.rsplit("/", 2)
     except ValueError:
         return False
 
-    parts[2] = f"{mountpoint}/-/versions.json"
-    uri = urllib.parse.urlunparse(parts)
+    parsed = parsed._replace(path=f"{mountpoint}/-/versions.json")
+    uri = urllib.parse.urlunparse(parsed)
 
     session = requests_cache.CachedSession(
         cache_name="datasette_cache",
@@ -92,6 +93,9 @@ class DatasetteAPI(Adapter):
     """
 
     safe = True
+
+    supports_limit = True
+    supports_offset = True
 
     @staticmethod
     def supports(uri: str, fast: bool = True, **kwargs: Any) -> Optional[bool]:
@@ -167,15 +171,24 @@ class DatasetteAPI(Adapter):
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **kwargs: Any,
     ) -> Iterator[Row]:
-        offset = 0
+        offset = offset or 0
         while True:
+            if limit is None:
+                # request 1 more, so we know if there are more pages to be fetched
+                end = DEFAULT_LIMIT + 1
+            else:
+                end = min(limit, DEFAULT_LIMIT + 1)
+
             sql = build_sql(
                 self.columns,
                 bounds,
                 order,
                 f'"{self.table}"',
-                limit=DEFAULT_LIMIT + 1,
+                limit=end,
                 offset=offset,
             )
             payload = self._run_query(sql)
@@ -197,4 +210,7 @@ class DatasetteAPI(Adapter):
 
             if not payload["truncated"] and len(rows) <= DEFAULT_LIMIT:
                 break
+
             offset += i + 1
+            if limit is not None:
+                limit -= i + 1

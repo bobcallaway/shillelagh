@@ -1,16 +1,16 @@
 """Helper functions for Shillelagh."""
+import base64
 import inspect
 import itertools
 import json
+import marshal
 import math
 import operator
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Type
-
-from pkg_resources import iter_entry_points
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Type, TypeVar
 
 from shillelagh.adapters.base import Adapter
 from shillelagh.exceptions import ImpossibleFilterError, ProgrammingError
-from shillelagh.fields import Field, Float, Integer, Order, String
+from shillelagh.fields import Boolean, Field, Float, Integer, Order, String
 from shillelagh.filters import (
     Equal,
     Filter,
@@ -75,6 +75,7 @@ class RowIDManager:
 
     def __init__(self, ranges: List[range]):
         if not ranges:
+            # pylint: disable=broad-exception-raised
             raise Exception("Argument ``ranges`` cannot be empty")
 
         self.ranges = ranges
@@ -94,6 +95,7 @@ class RowIDManager:
         """
         for range_ in self.ranges:
             if range_.start <= row_id < range_.stop:
+                # pylint: disable=broad-exception-raised
                 raise Exception(f"Row ID {row_id} already present")
 
     def insert(self, row_id: Optional[int] = None) -> int:
@@ -132,10 +134,11 @@ class RowIDManager:
 
                 return
 
+        # pylint: disable=broad-exception-raised
         raise Exception(f"Row ID {row_id} not found")
 
 
-def analyze(
+def analyze(  # pylint: disable=too-many-branches
     data: Iterator[Row],
 ) -> Tuple[int, Dict[str, Order], Dict[str, Type[Field]]]:
     """
@@ -162,7 +165,7 @@ def analyze(
             # determine types
             if types.get(column_name) == String:
                 continue
-            if isinstance(value, str):
+            if isinstance(value, (str, list, dict)):
                 types[column_name] = String
             elif types.get(column_name) == Float:
                 continue
@@ -170,8 +173,16 @@ def analyze(
                 types[column_name] = Float
             elif types.get(column_name) == Integer:
                 continue
-            else:
+            # ``isintance(True, int) == True`` :(
+            elif isinstance(value, int) and not isinstance(value, bool):
                 types[column_name] = Integer
+            elif types.get(column_name) == Boolean:
+                continue
+            elif isinstance(value, bool):
+                types[column_name] = Boolean
+            else:
+                # something weird, use string
+                types[column_name] = String
 
         previous_row = row
 
@@ -213,14 +224,24 @@ def update_order(
     return current_order
 
 
-def escape(value: str) -> str:
+def escape_string(value: str) -> str:
     """Escape single quotes."""
     return value.replace("'", "''")
 
 
-def unescape(value: str) -> str:
+def unescape_string(value: str) -> str:
     """Unescape single quotes."""
     return value.replace("''", "'")
+
+
+def escape_identifier(value: str) -> str:
+    """Escape double quotes."""
+    return value.replace('"', '""')
+
+
+def unescape_identifier(value: str) -> str:
+    """Unescape double quotes."""
+    return value.replace('""', '"')
 
 
 def serialize(value: Any) -> str:
@@ -230,7 +251,16 @@ def serialize(value: Any) -> str:
     This function is used with the SQLite backend, in order to serialize
     the arguments needed to instantiate an adapter via a virtual table.
     """
-    return f"'{escape(json.dumps(value))}'"
+    try:
+        serialized = marshal.dumps(value)
+    except ValueError as ex:
+        raise ProgrammingError(
+            f"The argument {value} is not serializable because it has type "
+            f"{type(value)}. Make sure only basic types (list, dicts, strings, "
+            "numbers) are passed as arguments to adapters.",
+        ) from ex
+
+    return escape_string(base64.b64encode(serialized).decode())
 
 
 def deserialize(value: str) -> Any:
@@ -240,7 +270,7 @@ def deserialize(value: str) -> Any:
     This function is used by the SQLite backend, in order to deserialize
     the virtual table definition and instantiate an adapter.
     """
-    return json.loads(unescape(value[1:-1]))
+    return marshal.loads(base64.b64decode(unescape_string(value).encode()))
 
 
 def build_sql(  # pylint: disable=too-many-locals, too-many-arguments, too-many-branches
@@ -251,18 +281,21 @@ def build_sql(  # pylint: disable=too-many-locals, too-many-arguments, too-many-
     column_map: Optional[Dict[str, str]] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
+    alias: Optional[str] = None,
 ) -> str:
     """
     Build a SQL query.
 
-    This is used by the GSheets and Socrata adapters, which use a simplified
-    SQL dialect to fetch data. For GSheets a column map is required, since the
-    SQL references columns by label ("A", "B", etc.) instead of name.
+    This is used by adapters which use a simplified SQL dialect to fetch data. For
+    GSheets a column map is required, since the SQL references columns by label
+    ("A", "B", etc.) instead of name.
     """
     sql = "SELECT *"
 
     if table:
         sql = f"{sql} FROM {table}"
+        if alias:
+            sql = f"{sql} AS {alias}"
 
     conditions = []
     for column_name, filter_ in bounds.items():
@@ -278,33 +311,17 @@ def build_sql(  # pylint: disable=too-many-locals, too-many-arguments, too-many-
 
         field = columns[column_name]
         id_ = column_map[column_name] if column_map else column_name
-        if isinstance(filter_, Impossible):
-            raise ImpossibleFilterError()
-        if isinstance(filter_, Equal):
-            conditions.append(f"{id_} = {field.quote(filter_.value)}")
-        elif isinstance(filter_, NotEqual):
-            conditions.append(f"{id_} != {field.quote(filter_.value)}")
-        elif isinstance(filter_, Range):
-            if filter_.start is not None:
-                operator_ = ">=" if filter_.include_start else ">"
-                conditions.append(f"{id_} {operator_} {field.quote(filter_.start)}")
-            if filter_.end is not None:
-                operator_ = "<=" if filter_.include_end else "<"
-                conditions.append(f"{id_} {operator_} {field.quote(filter_.end)}")
-        elif isinstance(filter_, Like):
-            conditions.append(f"{id_} LIKE {field.quote(filter_.value)}")
-        elif isinstance(filter_, IsNull):
-            conditions.append(f"{id_} IS NULL")
-        elif isinstance(filter_, IsNotNull):
-            conditions.append(f"{id_} IS NOT NULL")
-        else:
-            raise ProgrammingError(f"Invalid filter: {filter_}")
+        if alias:
+            id_ = f"{alias}.{id_}"
+        conditions.extend(get_conditions(id_, field, filter_))
     if conditions:
         sql = f"{sql} WHERE {' AND '.join(conditions)}"
 
     column_order: List[str] = []
     for column_name, requested_order in order:
         id_ = column_map[column_name] if column_map else column_name
+        if alias:
+            id_ = f"{alias}.{id_}"
         desc = " DESC" if requested_order == Order.DESCENDING else ""
         column_order.append(f"{id_}{desc}")
     if column_order:
@@ -315,6 +332,36 @@ def build_sql(  # pylint: disable=too-many-locals, too-many-arguments, too-many-
         sql = f"{sql} OFFSET {offset}"
 
     return sql
+
+
+def get_conditions(id_: str, field: Field, filter_: Filter) -> List[str]:
+    """
+    Build a SQL condition from a column ID and a filter.
+    """
+    if isinstance(filter_, Impossible):
+        raise ImpossibleFilterError()
+
+    if isinstance(filter_, Equal):
+        return [f"{id_} = {field.quote(filter_.value)}"]
+    if isinstance(filter_, NotEqual):
+        return [f"{id_} != {field.quote(filter_.value)}"]
+    if isinstance(filter_, Range):
+        conditions = []
+        if filter_.start is not None:
+            operator_ = ">=" if filter_.include_start else ">"
+            conditions.append(f"{id_} {operator_} {field.quote(filter_.start)}")
+        if filter_.end is not None:
+            operator_ = "<=" if filter_.include_end else "<"
+            conditions.append(f"{id_} {operator_} {field.quote(filter_.end)}")
+        return conditions
+    if isinstance(filter_, Like):
+        return [f"{id_} LIKE {field.quote(filter_.value)}"]
+    if isinstance(filter_, IsNull):
+        return [f"{id_} IS NULL"]
+    if isinstance(filter_, IsNotNull):
+        return [f"{id_} IS NOT NULL"]
+
+    raise ProgrammingError(f"Invalid filter: {filter_}")
 
 
 def combine_args_kwargs(
@@ -350,6 +397,8 @@ def filter_data(
     data: Iterator[Row],
     bounds: Dict[str, Filter],
     order: List[Tuple[str, RequestedOrder]],
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
 ) -> Iterator[Row]:
     """
     Apply filtering and sorting to a stream of rows.
@@ -405,14 +454,27 @@ def filter_data(
             rows.sort(key=operator.itemgetter(column_name), reverse=reverse)
         data = iter(rows)
 
+    data = apply_limit_and_offset(data, limit, offset)
+
     yield from data
 
 
-def get_available_adapters() -> Set[str]:
+T = TypeVar("T")
+
+
+def apply_limit_and_offset(
+    rows: Iterator[T],
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> Iterator[T]:
     """
-    Return the name of the available adapters.
+    Apply limit/offset to a stream of rows.
     """
-    return {entry_point.name for entry_point in iter_entry_points("shillelagh.adapter")}
+    if limit is not None or offset is not None:
+        start = offset or 0
+        end = None if limit is None else start + limit
+        rows = itertools.islice(rows, start, end)
+    return rows
 
 
 def SimpleCostModel(rows: int, fixed_cost: int = 0):  # pylint: disable=invalid-name
@@ -443,7 +505,7 @@ def find_adapter(
     uri: str,
     adapter_kwargs: Dict[str, Any],
     adapters: List[Type[Adapter]],
-) -> Type[Adapter]:
+) -> Tuple[Type[Adapter], Tuple[Any, ...], Dict[str, Any]]:
     """
     Find an adapter that handles a given URI.
 
@@ -459,7 +521,8 @@ def find_adapter(
         kwargs = adapter_kwargs.get(key, {})
         supported: Optional[bool] = adapter.supports(uri, fast=True, **kwargs)
         if supported:
-            return adapter
+            args = adapter.parse_uri(uri)
+            return adapter, args, kwargs
         if supported is None:
             candidates.add(adapter)
 
@@ -467,6 +530,16 @@ def find_adapter(
         key = adapter.__name__.lower()
         kwargs = adapter_kwargs.get(key, {})
         if adapter.supports(uri, fast=False, **kwargs):
-            return adapter
+            args = adapter.parse_uri(uri)
+            return adapter, args, kwargs
 
     raise ProgrammingError(f"Unsupported table: {uri}")
+
+
+def flatten(row: Row) -> Row:
+    """
+    Function that converts JSON to strings, to flatten rows.
+    """
+    return {
+        k: json.dumps(v) if isinstance(v, (list, dict)) else v for k, v in row.items()
+    }

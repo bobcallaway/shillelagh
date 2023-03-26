@@ -1,9 +1,11 @@
-# pylint: disable=invalid-name, no-self-use, fixme
 """
 Parse and format Google Sheet date/time patterns.
 
 https://developers.google.com/sheets/api/guides/formats?hl=en#date_and_time_format_patterns
 """
+
+# pylint: disable=invalid-name, fixme, broad-exception-raised
+
 import calendar
 import re
 from collections import defaultdict
@@ -419,7 +421,7 @@ class ZERO(Token):
         precision = len(self.token)
         us = value.microseconds if isinstance(value, timedelta) else value.microsecond
         rounded = round(us / 1e6, precision)
-        return str(int(rounded * 10 ** precision)).zfill(precision)
+        return str(int(rounded * 10**precision)).zfill(precision)
 
     def parse(self, value: str, tokens: List[Token]) -> Tuple[Dict[str, Any], str]:
         size = len(self.token)

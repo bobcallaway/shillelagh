@@ -1,7 +1,9 @@
-# pylint: disable=invalid-name
 """
 An adapter for in-memory Pandas dataframes.
 """
+
+# pylint: disable=invalid-name
+
 import inspect
 import operator
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
@@ -68,6 +70,70 @@ def find_dataframe(uri: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def get_df_data(  # pylint: disable=too-many-arguments
+    df: pd.DataFrame,
+    columns: Dict[str, Field],
+    bounds: Dict[str, Filter],
+    order: List[Tuple[str, RequestedOrder]],
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> Iterator[Row]:
+    """
+    Apply the ``get_data`` method on a Pandas dataframe.
+    """
+    # ensure column names are strings
+    df = df.rename(columns={k: str(k) for k in df.columns})
+
+    column_names = list(columns.keys())
+    df = df[column_names]
+
+    for column_name, filter_ in bounds.items():
+        if isinstance(filter_, Impossible):
+            return
+        if isinstance(filter_, Equal):
+            df = df[df[column_name] == filter_.value]
+        elif isinstance(filter_, NotEqual):
+            df = df[df[column_name] != filter_.value]
+        elif isinstance(filter_, Range):
+            if filter_.start is not None:
+                operator_ = operator.ge if filter_.include_start else operator.gt
+                df = df[operator_(df[column_name], filter_.start)]
+            if filter_.end is not None:
+                operator_ = operator.le if filter_.include_end else operator.lt
+                df = df[operator_(df[column_name], filter_.end)]
+        elif isinstance(filter_, IsNull):
+            df = df[~df[column_name].notnull()]
+        elif isinstance(filter_, IsNotNull):
+            df = df[df[column_name].notnull()]
+        else:
+            raise ProgrammingError(f"Invalid filter: {filter_}")
+
+    if order:
+        by, requested_orders = list(zip(*order))
+        ascending = [
+            requested_order == Order.ASCENDING for requested_order in requested_orders
+        ]
+        df = df.sort_values(by=list(by), ascending=ascending)
+
+    df = df[offset:]
+    df = df[:limit]
+
+    for row in df.itertuples(name=None):
+        yield dict(zip(["rowid", *column_names], row))
+
+
+def get_columns_from_df(df: pd.DataFrame) -> Dict[str, Field]:
+    """
+    Construct adapter columns from a Pandas dataframe.
+    """
+    return {
+        # ensure column name is string
+        str(column_name): get_field(dtype)
+        for column_name, dtype in zip(df.columns, df.dtypes)
+        if dtype.kind in type_map
+    }
+
+
 class PandasMemory(Adapter):
 
     """
@@ -75,6 +141,9 @@ class PandasMemory(Adapter):
     """
 
     safe = False
+
+    supports_limit = True
+    supports_offset = True
 
     @staticmethod
     def supports(uri: str, fast: bool = True, **kwargs: Any) -> Optional[bool]:
@@ -91,11 +160,7 @@ class PandasMemory(Adapter):
             raise ProgrammingError("Could not find dataframe")
 
         self.df = df
-        self.columns = {
-            column_name: get_field(dtype)
-            for column_name, dtype in zip(self.df.columns, self.df.dtypes)
-            if dtype.kind in type_map
-        }
+        self.columns = get_columns_from_df(df)
 
     def get_columns(self) -> Dict[str, Field]:
         return self.columns
@@ -106,41 +171,11 @@ class PandasMemory(Adapter):
         self,
         bounds: Dict[str, Filter],
         order: List[Tuple[str, RequestedOrder]],
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        **kwargs: Any,
     ) -> Iterator[Row]:
-        column_names = list(self.columns.keys())
-        df = self.df[column_names]
-
-        for column_name, filter_ in bounds.items():
-            if isinstance(filter_, Impossible):
-                return
-            if isinstance(filter_, Equal):
-                df = df[df[column_name] == filter_.value]
-            elif isinstance(filter_, NotEqual):
-                df = df[df[column_name] != filter_.value]
-            elif isinstance(filter_, Range):
-                if filter_.start is not None:
-                    operator_ = operator.ge if filter_.include_start else operator.gt
-                    df = df[operator_(df[column_name], filter_.start)]
-                if filter_.end is not None:
-                    operator_ = operator.le if filter_.include_end else operator.lt
-                    df = df[operator_(df[column_name], filter_.end)]
-            elif isinstance(filter_, IsNull):
-                df = df[~df[column_name].notnull()]
-            elif isinstance(filter_, IsNotNull):
-                df = df[df[column_name].notnull()]
-            else:
-                raise ProgrammingError(f"Invalid filter: {filter_}")
-
-        if order:
-            by, requested_orders = list(zip(*order))
-            ascending = [
-                requested_order == Order.ASCENDING
-                for requested_order in requested_orders
-            ]
-            df = df.sort_values(by=list(by), ascending=ascending)
-
-        for row in df.itertuples(name=None):
-            yield dict(zip(["rowid", *column_names], row))
+        yield from get_df_data(self.df, self.columns, bounds, order, limit, offset)
 
     def insert_data(self, row: Row) -> int:
         row_id: Optional[int] = row.pop("rowid")
